@@ -119,6 +119,25 @@
 #include <openssl/bio.h>
 #include <openssl/err.h>
 
+#ifdef OPENSSL_SYS_WIN32
+#pragma warning(push, 3)
+#include <windows.h>
+#pragma warning(pop)
+
+typedef DWORD TLS_KEY;
+#else
+#include <pthread.h>
+
+typedef pthread_key_t TLS_KEY;
+#endif
+
+static int err_tls_init = 0;
+static TLS_KEY err_tls_key;
+
+static void err_tls_init_once();
+static void *err_tls_get(TLS_KEY key);
+static void err_tls_set(TLS_KEY key, void *p);
+
 DECLARE_LHASH_OF(ERR_STRING_DATA);
 DECLARE_LHASH_OF(ERR_STATE);
 
@@ -279,8 +298,6 @@ static const ERR_FNS *err_fns = NULL;
  * implementations and state in the loading application.
  */
 static LHASH_OF(ERR_STRING_DATA) *int_error_hash = NULL;
-static LHASH_OF(ERR_STATE) *int_thread_hash = NULL;
-static int int_thread_hash_references = 0;
 static int int_err_library_number = ERR_LIB_USER;
 
 /*
@@ -431,120 +448,42 @@ static ERR_STRING_DATA *int_err_del_item(ERR_STRING_DATA *d)
     return p;
 }
 
-static unsigned long err_state_hash(const ERR_STATE *a)
-{
-    return CRYPTO_THREADID_hash(&a->tid) * 13;
-}
-
-static IMPLEMENT_LHASH_HASH_FN(err_state, ERR_STATE)
-
-static int err_state_cmp(const ERR_STATE *a, const ERR_STATE *b)
-{
-    return CRYPTO_THREADID_cmp(&a->tid, &b->tid);
-}
-
-static IMPLEMENT_LHASH_COMP_FN(err_state, ERR_STATE)
-
 static LHASH_OF(ERR_STATE) *int_thread_get(int create)
 {
-    LHASH_OF(ERR_STATE) *ret = NULL;
-
-    CRYPTO_w_lock(CRYPTO_LOCK_ERR);
-    if (!int_thread_hash && create) {
-        CRYPTO_push_info("int_thread_get (err.c)");
-        int_thread_hash = lh_ERR_STATE_new();
-        CRYPTO_pop_info();
-    }
-    if (int_thread_hash) {
-        int_thread_hash_references++;
-        ret = int_thread_hash;
-    }
-    CRYPTO_w_unlock(CRYPTO_LOCK_ERR);
-    return ret;
+   return NULL;
 }
 
 static void int_thread_release(LHASH_OF(ERR_STATE) **hash)
 {
-    int i;
-
-    if (hash == NULL || *hash == NULL)
-        return;
-
-    i = CRYPTO_add(&int_thread_hash_references, -1, CRYPTO_LOCK_ERR);
-
-#ifdef REF_PRINT
-    fprintf(stderr, "%4d:%s\n", int_thread_hash_references, "ERR");
-#endif
-    if (i > 0)
-        return;
-#ifdef REF_CHECK
-    if (i < 0) {
-        fprintf(stderr, "int_thread_release, bad reference count\n");
-        abort();                /* ok */
-    }
-#endif
-    *hash = NULL;
 }
 
 static ERR_STATE *int_thread_get_item(const ERR_STATE *d)
 {
-    ERR_STATE *p;
-    LHASH_OF(ERR_STATE) *hash;
-
-    err_fns_check();
-    hash = ERRFN(thread_get) (0);
-    if (!hash)
-        return NULL;
-
-    CRYPTO_r_lock(CRYPTO_LOCK_ERR);
-    p = lh_ERR_STATE_retrieve(hash, d);
-    CRYPTO_r_unlock(CRYPTO_LOCK_ERR);
-
-    ERRFN(thread_release) (&hash);
-    return p;
+	err_tls_init_once();
+	return err_tls_get(err_tls_key);
 }
 
 static ERR_STATE *int_thread_set_item(ERR_STATE *d)
 {
     ERR_STATE *p;
-    LHASH_OF(ERR_STATE) *hash;
 
-    err_fns_check();
-    hash = ERRFN(thread_get) (1);
-    if (!hash)
-        return NULL;
-
-    CRYPTO_w_lock(CRYPTO_LOCK_ERR);
-    p = lh_ERR_STATE_insert(hash, d);
-    CRYPTO_w_unlock(CRYPTO_LOCK_ERR);
-
-    ERRFN(thread_release) (&hash);
-    return p;
+	err_tls_init_once();
+	p = err_tls_get(err_tls_key);
+	err_tls_set(err_tls_key, d);
+	return p;
 }
 
 static void int_thread_del_item(const ERR_STATE *d)
 {
     ERR_STATE *p;
-    LHASH_OF(ERR_STATE) *hash;
 
-    err_fns_check();
-    hash = ERRFN(thread_get) (0);
-    if (!hash)
-        return;
+	err_tls_init_once();
+	p = err_tls_get(err_tls_key);
 
-    CRYPTO_w_lock(CRYPTO_LOCK_ERR);
-    p = lh_ERR_STATE_delete(hash, d);
-    /* make sure we don't leak memory */
-    if (int_thread_hash_references == 1
-        && int_thread_hash && lh_ERR_STATE_num_items(int_thread_hash) == 0) {
-        lh_ERR_STATE_free(int_thread_hash);
-        int_thread_hash = NULL;
-    }
-    CRYPTO_w_unlock(CRYPTO_LOCK_ERR);
-
-    ERRFN(thread_release) (&hash);
-    if (p)
-        ERR_STATE_free(p);
+	if( p ) {
+		ERR_STATE_free(p);
+		err_tls_set(err_tls_key, NULL);
+	}
 }
 
 static int int_err_get_next_lib(void)
@@ -1143,3 +1082,45 @@ int ERR_pop_to_mark(void)
     es->err_flags[es->top] &= ~ERR_FLAG_MARK;
     return 1;
 }
+
+// static int err_tls_init = 0;
+// static TLS_KEY err_tls_key;
+
+#ifdef OPENSSL_SYS_WIN32
+static void err_tls_do_init() {
+	err_tls_key = TlsAlloc();
+}
+
+static void *err_tls_get(TLS_KEY key) {
+	return TlsGetValue(err_tls_key);
+}
+
+static void err_tls_set(TLS_KEY key, void *p) {
+	TlsSetValue(err_tls_key, p);
+}
+
+#else
+static void err_tls_do_init() {
+	pthread_key_create(&err_tls_key, NULL);
+}
+
+static void *err_tls_get(TLS_KEY key) {
+	return pthread_getspecific(err_tls_key);
+}
+
+static void err_tls_set(TLS_KEY key, void *p) {
+	pthread_setspecific(err_tls_key, p);
+}
+
+#endif
+
+static void err_tls_init_once() {
+	if( err_tls_init )
+		return;
+
+	CRYPTO_w_lock(CRYPTO_LOCK_ERR);
+	err_tls_do_init();
+	err_tls_init = 1;
+	CRYPTO_w_unlock(CRYPTO_LOCK_ERR);
+}
+
